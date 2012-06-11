@@ -3,12 +3,13 @@
 namespace ZfcBase\Mapper;
 
 use ArrayObject;
+use DateTime;
 use Traversable;
 use Zend\Db\TableGateway\TableGatewayInterface;
 use Zend\Db\TableGateway\AbstractTableGateway;
 use Zend\Db\TableGateway\TableGateway;
 use ZfcBase\EventManager\EventProvider;
-use ZfcBase\Model\AbstractModel;
+use ZfcBase\Util\String;
 use ZfcUser\Module as ZfcUser;
 
 abstract class AbstractDbMapper extends EventProvider implements DataMapperInterface
@@ -19,6 +20,11 @@ abstract class AbstractDbMapper extends EventProvider implements DataMapperInter
      * @var TableGatewayInterface
      */
     protected $tableGateway;
+
+    /**
+     * @var array
+     */
+    protected $identityMap = array();
 
     /**
      * Get table name
@@ -56,68 +62,6 @@ abstract class AbstractDbMapper extends EventProvider implements DataMapperInter
     }
 
     /**
-     * toScalarValueArray 
-     * 
-     * @param array $values 
-     * @return array
-     */
-    protected function toScalarValueArray($values) {
-        //convert object toArray first
-        if(is_object($values)) {
-            if(is_callable(array($values, 'toScalarValueArray'))) {
-                return $values->toScalarValueArray();
-            }
-            
-            if(is_callable(array($values, 'toArray'))) {
-                $values = $values->toArray();
-            }
-        }
-        
-        if(!is_array($values)) {
-            throw new Exception\InvalidArgumentException("Parameter is not an array");
-        }
-        
-        $ret = array();
-        foreach($values as $key => $value) {
-            if(is_scalar($value)) {
-                $ret[$key] = $value;
-                continue;
-            }
-            if(is_object($value)) {
-                $ret[$key] = $this->convertObjectToScalar($value);
-                continue;
-            }
-            if($value == null) {
-                $ret[$key] = null;
-                continue;
-            }
-            
-            throw new Exception\InvalidArgumentException("Can not convert '$key' key value to string");
-        }
-        
-        return $ret;
-    }
-
-    /**
-     * convertObjectToScalar 
-     * 
-     * @param mixed $obj 
-     * @access string
-     * @return void
-     */
-    protected function convertObjectToScalar($obj) {
-
-        if(is_callable(array($obj, '__toString'))) {
-            return $obj->__toString();
-        }
-        if($obj instanceof \DateTime) {
-            return $obj->format('Y-m-d\TH:i:s');
-        }
-        
-        throw new Exception\InvalidArgumentException("Can not convert object '" . get_class($obj) . "' to string");
-    }
-
-    /**
      * @param $id
      * @return object
      */
@@ -130,7 +74,7 @@ abstract class AbstractDbMapper extends EventProvider implements DataMapperInter
         return $model;
     }
 
-    abstract protected function fromRow($row);
+    abstract public function fromRow($row);
 
     /**
      * Persists a mapped object
@@ -145,11 +89,16 @@ abstract class AbstractDbMapper extends EventProvider implements DataMapperInter
         if (!is_object($model) || \get_class($model) !== $this->getClassName()) {
             throw new Exception\InvalidArgumentException('$model must be an instance of ' . $this->getClassName());
         }
-        $data = new ArrayObject($this->toScalarValueArray($model)); // or perhaps pass it by reference?
-        $this->events()->trigger(__FUNCTION__ . '.pre', $this, array('data' => $data, 'model' => $model));
-        $idGetter = AbstractModel::fieldToGetterMethod($this->getPrimaryKey());
-        if ($model->$idGetter() > 0) {
-            $this->getTableGateway()->update((array) $data, array($this->getPrimaryKey() => $model->$idGetter()));
+        $data = $this->getHydrator()->extract($model);
+        $results = $this->events()->trigger(__FUNCTION__ . '.pre', $this, array('data' => $data, 'model' => $model));
+        if (!$results->isEmpty()) {
+            $result = $results->last();
+            $data = $result->getParam('data');
+            $model = $result->getParam('model');
+        }
+
+        if ($data[$this->getPrimaryKey()] > 0) {
+            $this->getTableGateway()->update((array) $data, array($this->getPrimaryKey() => $data[$this->getPrimaryKey()]));
         } else {
             $this->getTableGateway()->insert((array) $data);
             if (!$this->getTableGateway() instanceof AbstractTableGateway) {
@@ -159,10 +108,125 @@ abstract class AbstractDbMapper extends EventProvider implements DataMapperInter
                 );
             }
             $id = $this->getTableGateway()->getAdapter()->getDriver()->getLastGeneratedValue();
-            $idSetter = AbstractModel::fieldToSetterMethod($this->getPrimaryKey());
-            $model->$idSetter($id);
+            if ($id) {
+                $idSetter = self::fieldToSetterMethod($this->getPrimaryKey());
+                $model->$idSetter($id);
+            }
         }
         return $model;
     }
 
+    /**
+     * add entity to identity map
+     *
+     * @param object $entity
+     * @return bool
+     */
+    public function addToIdentityMap($entity)
+    {
+        $className = $this->getClassName();
+        $id = serialize($this->getIdentifier($entity));
+        if (isset($this->identityMap[$className][$id])) {
+            return false;
+        }
+        $this->identityMap[$className][$id] = $entity;
+        return true;
+    }
+
+    /**
+     * Checks whether an entity is registered in the identity map
+     *
+     * @param object $entity
+     * @return boolean
+     */
+    public function isInIdentityMap($entity)
+    {
+        $className = $this->getClassName();
+        $id = serialize($this->getIdentifier($entity));
+        return isset($this->identityMap[$className][$id]);
+    }
+
+    /**
+     * remove from identity map
+     *
+     * @param object $entity
+     * @return bool
+     */
+    public function removeFromIdentityMap($entity)
+    {
+        $className = $this->getClassName();
+        $id = serialize($this->getIdentifier($entity));
+        if (isset($this->identityMap[$className][$id])) {
+            unset($this->identityMap[$className][$id]);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * look up for an entity by id in identity map
+     *
+     * @param string $className
+     * @param $id
+     * @return object|false
+     */
+    public function lookupIdentityMap($className, $id)
+    {
+        $id = serialize($id);
+        if (isset($this->identityMap[$className][$id])) {
+            return $this->identityMap[$className][$id];
+        }
+        return false;
+    }
+
+    /**
+     * get the identifier of an entity
+     *
+     * @param object $entity
+     * @return mixed
+     * @throws Exception\InvalidArgumentException
+     */
+    public function getIdentifier($entity)
+    {
+        $className = $this->getClassName();
+        if (!is_object($entity) || get_class($entity) !== $className) {
+            throw new Exception\InvalidArgumentException('$entity must be an object of type ' . $className);
+        }
+        $pk = $this->getPrimaryKey();
+        $idGetter = self::fieldToGetterMethod($pk);
+        if (method_exists($entity, $idGetter)) {
+            $id = $entity->$idGetter();
+        } else {
+            $property = new \ReflectionProperty($className, $pk);
+            $property->setAccessible(true);
+            $id = $property->getValue($entity);
+        }
+        return $id;
+    }
+
+    /**
+     * Gets the identity map
+     *
+     * @return array
+     */
+    public function getIdentityMap()
+    {
+        return $this->identityMap;
+    }
+
+    /**
+     * @abstract
+     * @return \Zend\Stdlib\Hydrator\HydratorInterface
+     */
+    abstract public function getHydrator();
+
+    public static function fieldToSetterMethod($name)
+    {
+        return 'set' . String::toCamelCase($name);
+    }
+
+    public static function fieldToGetterMethod($name)
+    {
+        return 'get' . String::toCamelCase($name);
+    }
 }

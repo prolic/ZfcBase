@@ -29,8 +29,6 @@ Provided Classes
   simply a hack until the Zend\Db refactoring is complete.
 * `ZfcBase\Mapper\AbstractDbMapper` - An abstract mapper for Zend\Db that
   allows for different read and write DB connections (master/slave).
-* `ZfcBase\Model\AbstractModel` - An abstract model class with factory
-  methods for instantiating from an associative array (database result).
 * `ZfcBase\Form\ProvidesEventsForm` - Extends Zend\Form and provides the
   functionality of `ZfcBase\EventManager\EventProvider` (basically it's a
   crutch since we can't use traits yet).
